@@ -1,0 +1,29 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=America/Mexico_City
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git python3 python3-pip python3-venv python3-dev \
+    build-essential ccache g++ gawk make wget \
+    libtool libxml2-dev libxslt1-dev \
+    sudo lsb-release tzdata curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG ARDUPILOT_TAG=Copter-4.5.7
+RUN git clone --recursive --depth 1 --branch ${ARDUPILOT_TAG} \
+    https://github.com/ArduPilot/ardupilot.git /root/ardupilot
+
+WORKDIR /root/ardupilot
+RUN USER=root Tools/environment_install/install-prereqs-ubuntu.sh -y || true
+
+RUN pip3 install --no-cache-dir \
+    pymavlink MAVProxy empy==3.3.4 pexpect future lxml
+
+RUN ./waf configure --board sitl && ./waf copter -j2
+
+ENV PATH=/root/ardupilot/Tools/autotest:/root/ardupilot/build/sitl/bin:$PATH
+ENV PARAM_FILE_DIR=/root/ardupilot/Tools/autotest/default_params
+
+WORKDIR /root
+CMD ["bash"]

@@ -93,6 +93,34 @@ para ZED + Jetson se documentan en el reporte de ingeniería de detalle
 | ArduCopter | 4.5 | GPL-3.0 |
 | TensorRT | 8.x (FP16) | NVIDIA EULA |
 
+### Simulación (`getaway-sim/`)
+
+Para iterar sin hardware se incluye una **simulación end-to-end en Docker**:
+ArduCopter SITL + Gazebo Harmonic + ROS 2 Humble + Ultralytics, con dron F450,
+cámara RGB-D (stand-in ZED 2) y un mesh GLB realista de ambulancia. QGroundControl
+se conecta vía UDP 14550 para tomar control manual en cualquier momento.
+
+```bash
+cd getaway-sim
+make build   # ~25 min primera vez
+make up      # arranca sitl + sim
+```
+
+Stream MJPEG con bbox y HUD en <http://localhost:8080>. Ver
+[`getaway-sim/README.md`](getaway-sim/README.md) para detalles completos
+(controlador de velocidad, modo manual, estabilización digital, tuning).
+
+**Hallazgos del sim que aplican a hardware real:**
+- El controlador original (`position-target`) provoca overshoot agresivo y pierde
+  el target. La versión del sim usa **velocity-target** (`SET_POSITION_TARGET_LOCAL_NED`
+  con `type_mask = 0x07C7`) con caps `V_FWD_MAX = 8 m/s`, `V_LAT_MAX = 2 m/s`,
+  `YAW_RATE_MAX = 0.5 rad/s`. Pendiente backportar a `drone_refactor.py`.
+- Cámara hard-mounted al frame transmite roll/pitch → se aplica counter-rotación
+  digital (`cv2.warpAffine`) en el stream para estabilizar el horizonte.
+- Modo manual ↔ autónomo se conmuta vía cambio de flight mode en QGC: `GUIDED` =
+  script en control; `LOITER`/`ALT_HOLD`/`STABILIZE` = piloto en control. El script
+  detecta el modo en el heartbeat y suspende sus comandos en automático.
+
 **Modelo de IA:** YOLO26m fine-tuneado sobre un dataset propio de **2,261
 imágenes** de vehículos de emergencia mexicanos (Cruz Roja, IMSS, ERUM, SSP,
 Guardia Nacional, Bomberos CDMX y Monterrey), anotadas en Roboflow.

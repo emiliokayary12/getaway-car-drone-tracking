@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <model name="ambulance">
+    <!-- Pose set in world via <include><pose>. Mass realistic ambulance ~2500kg. -->
+    <link name="body">
+      <inertial>
+        <mass>2500</mass>
+        <inertia>
+          <ixx>1200</ixx><iyy>4000</iyy><izz>4000</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <!-- Simple box collision so physics is fast. Mesh only for visuals. -->
+      <collision name="c">
+        <pose>0 0 1.0 0 0 0</pose>
+        <geometry>
+          <box><size>5.0 2.2 2.4</size></box>
+        </geometry>
+      </collision>
+
+      <!-- Visual: mesh. Y-up glTF → rotate +90° X to make Z-up. -->
+      <visual name="v">
+        <pose>0 0 0 1.5708 0 0</pose>
+        <geometry>
+          <mesh>
+            <uri>model://ambulance_mesh/meshes/ambulance.glb</uri>
+            <scale>1 1 1</scale>
+          </mesh>
+        </geometry>
+      </visual>
+    </link>
+
+    <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl">
+      <topic>/model/ambulance/cmd_vel</topic>
+    </plugin>
+  </model>
+</sdf>
