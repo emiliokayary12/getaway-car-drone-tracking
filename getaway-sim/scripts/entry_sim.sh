@@ -35,11 +35,16 @@ echo "── DIAG: last 40 lines Gazebo log ──"
 tail -n 40 /tmp/gz.log
 echo "── DIAG end ──"
 
-echo "── ros_gz_bridge: camera + depth ──"
+echo "── ros_gz_bridge: camera + depth + ambulance teleop ──"
+# Nota: en ros_gz_bridge el topic name es el mismo del lado ROS y GZ.
+# `--ros-args -r` SOLO renombra el lado ROS — no remapea el lado GZ.
+# Por eso publicamos directamente al topic GZ /model/ambulance/cmd_vel
+# y dejamos el mismo nombre del lado ROS (raro como nombre ROS, pero funciona).
 ros2 run ros_gz_bridge parameter_bridge \
   /world/getaway/model/iris_with_camera/link/camera_link/sensor/camera/image@sensor_msgs/msg/Image@gz.msgs.Image \
   /world/getaway/model/iris_with_camera/link/camera_link/sensor/camera/camera_info@sensor_msgs/msg/CameraInfo@gz.msgs.CameraInfo \
   /world/getaway/model/iris_with_camera/link/camera_link/sensor/depth/depth_image@sensor_msgs/msg/Image@gz.msgs.Image \
+  /model/ambulance/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist \
   --ros-args -r /world/getaway/model/iris_with_camera/link/camera_link/sensor/camera/image:=/camera/image \
              -r /world/getaway/model/iris_with_camera/link/camera_link/sensor/camera/camera_info:=/camera/info \
              -r /world/getaway/model/iris_with_camera/link/camera_link/sensor/depth/depth_image:=/camera/depth &
@@ -53,13 +58,16 @@ echo "── DIAG: ROS hz on /camera/image (3s sample) ──"
 timeout 3 ros2 topic hz /camera/image 2>&1 || true
 echo "── DIAG end ROS ──"
 
-echo "── Starting ambulance motion (5 m/s = 18 km/h, gentle curve) ──"
+echo "── Starting ambulance motion (7 m/s en círculo R≈60m, +30s delay; pausa si /tmp/manual_mode existe) ──"
 (
-  sleep 5
+  sleep 35
   while true; do
-    gz topic -t /model/ambulance/cmd_vel -m gz.msgs.Twist \
-      -p "linear: {x: 5.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.05}" 2>/dev/null || true
-    sleep 5
+    if [ ! -f /tmp/manual_mode ]; then
+      # R = v / ω → 60 = 7 / 0.1167
+      gz topic -t /model/ambulance/cmd_vel -m gz.msgs.Twist \
+        -p "linear: {x: 7.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.1167}" 2>/dev/null || true
+    fi
+    sleep 1
   done
 ) &
 AMB_PID=$!

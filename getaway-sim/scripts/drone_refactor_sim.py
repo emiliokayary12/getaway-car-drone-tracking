@@ -30,26 +30,42 @@ MAVLINK_URL   = os.environ.get("MAVLINK_URL", "udp:127.0.0.1:14551")
 DIST_OBJETIVO = 12.0  # m, target chase distance (safe trailing gap)
 TAKEOFF_ALT   = 6.0   # m (higher to see far + safety margin)
 
-# ── Velocity-based PID gains ──
-# Forward: P on (depth - DIST_OBJETIVO) → m/s forward. Match ambulance speed.
-KP_VX = 0.4           # m/s per m error
-V_FWD_MAX = 8.0       # m/s forward cap (~29 km/h — keep up with 18 km/h amb + close gap)
+# ── Velocity-based controller, P-only con suavizado en inputs ──
+# Lecciones de iteraciones anteriores:
+#   - Feedforward sobre d(depth)/dt = mal: range rate es velocidad RELATIVA;
+#     cuando el drone acelera, ddepth cae → FF acelera más → loop positivo.
+#   - Feedforward sobre dcx/dt = mal: el propio yaw del drone hace que el bbox
+#     se mueva en imagen, FF interpreta como movimiento del target → oscilación.
+#   - Suavizar derivadas no arregla nada; la señal es la equivocada.
+# Solución: P-only con EMA en INPUTS (cx, depth) — suaviza el jitter del YOLO
+# sin meter el ruido del propio control. Prioriza centrar (yaw) sobre cerrar
+# distancia: si target off-center, escala vx hacia 0 hasta que drone gire.
 
-# Lateral: P on (cx - CX) / CX → m/s right (BODY frame)
-KP_VY = 1.5           # m/s per normalized pixel error
-V_LAT_MAX = 2.0       # m/s lateral cap
+KP_VX = 0.7           # P sobre (depth - DIST_OBJETIVO)
+V_FWD_MAX = 12.0      # m/s — cap forward (>>ambulancia 7 m/s para alcanzar)
 
-# Yaw rate: P on horizontal pixel angle → rad/s
-KP_YAW_RATE = 0.8     # rad/s per rad error
-YAW_RATE_MAX = 0.5    # rad/s cap (~28°/s)
+KP_VY = 1.0           # P sobre (px_err / CX)
+V_LAT_MAX = 2.0       # m/s — cap lateral
 
-# Altitude hold: P on (TAKEOFF_ALT - rel_alt) → m/s down
+KP_YAW_RATE = 1.2     # P sobre ángulo pixel — gana prioridad para centrar
+YAW_RATE_MAX = 1.0    # rad/s — cap alto para curvas cerradas
+
 KP_VZ = 0.4
 V_VERT_MAX = 1.0
 
-DEAD_ZONE_PX = 60     # ignore offsets within ±N px of center
+# Smoothing en inputs + slew limit en comandos
+ALPHA_EMA   = 0.5     # EMA sobre cx y depth. ↑ = más smoothing, más lag
+SLEW_VX     = 4.0     # m/s² — rate máximo de cambio del comando vx
+SLEW_VY     = 2.0
+SLEW_YAW    = 2.0     # rad/s²
+LOCK_TIMEOUT_S = 3.0  # tolerancia alta — trasera de ambulancia da detecciones intermitentes
+
+DEAD_ZONE_PX    = 50  # ignora errores ±N px del centro
+DEAD_ZONE_DEPTH = 2.0 # ignora errores ±N m de DIST_OBJETIVO
+CONF_LOCK    = 0.25   # umbral bajo — trasera de ambulancia tiene bbox/conf chica
+CONF_ACQUIRE = 0.40   # umbral inicial menos exigente para enganchar rápido
 MIN_ALT_M    = 3.0
-CMD_RATE_HZ  = 10.0   # velocity setpoints — need higher rate
+CMD_RATE_HZ  = 15.0   # rate de setpoints
 
 shutdown_flag  = threading.Event()
 emergency_kill = threading.Event()
@@ -298,32 +314,107 @@ def _clamp(x, lim):
     return max(-lim, min(lim, x))
 
 
-def calcular_velocidad(cx, cy, depth_val, cur_alt):
-    """Pixel error + depth → BODY velocity setpoint (vx fwd, vy right, vz down, yaw_rate)."""
-    px_err = cx - CX_ZED
-    if abs(px_err) < DEAD_ZONE_PX:
-        px_err = 0.0
+# ── Tracker de estado entre frames ──
+class TargetTracker:
+    """P-only controller con suavizado en inputs y slew limit en comandos.
 
-    # Forward: close gap toward DIST_OBJETIVO
-    vx = (depth_val - DIST_OBJETIVO) * KP_VX
-    vx = _clamp(vx, V_FWD_MAX)
+    Diseño:
+      - EMA en (cx, depth) — suaviza jitter del bounding box / depth lookup.
+      - NO derivadas / feedforward (causaban oscilaciones).
+      - Dead-zone en px_err y depth_err para no perseguir errores chicos.
+      - center_factor: cuando target está off-center, escala vx hacia 0 →
+        el drone gira primero (yaw), avanza después. Evita pasar de largo
+        en chases circulares.
+      - Hysteresis de confidence (CONF_ACQUIRE > CONF_LOCK).
+      - Lock timeout grande (LOCK_TIMEOUT_S) tolera detecciones intermitentes.
+    """
 
-    # Lateral: normalized px error × gain
-    x_norm = px_err / CX_ZED  # ~[-1, +1]
-    vy = x_norm * KP_VY
-    vy = _clamp(vy, V_LAT_MAX)
+    def __init__(self):
+        self.cx_ema = None
+        self.depth_ema = None
+        self.prev_vx_cmd = 0.0
+        self.prev_vy_cmd = 0.0
+        self.prev_yaw_cmd = 0.0
+        self.locked = False
+        self.last_seen_t = 0.0
 
-    # Yaw rate: P on angular error (small angle ≈ px_err / FX)
-    yaw_err = math.atan2(px_err / FX_ZED, 1.0)
-    yaw_rate = yaw_err * KP_YAW_RATE
-    yaw_rate = _clamp(yaw_rate, YAW_RATE_MAX)
+    def update_lock(self, conf: float, t_now: float) -> bool:
+        if self.locked:
+            if conf >= CONF_LOCK:
+                self.last_seen_t = t_now
+                return True
+            return False
+        if conf >= CONF_ACQUIRE:
+            self.locked = True
+            self.last_seen_t = t_now
+            self.cx_ema = None       # reset EMA al adquirir lock fresco
+            self.depth_ema = None
+            return True
+        return False
 
-    # Altitude hold (vz positive = down). Climb if below TAKEOFF_ALT.
-    alt_err = TAKEOFF_ALT - cur_alt
-    vz = -alt_err * KP_VZ  # negative because down=+
-    vz = _clamp(vz, V_VERT_MAX)
+    def check_timeout(self, t_now: float) -> None:
+        if self.locked and (t_now - self.last_seen_t) > LOCK_TIMEOUT_S:
+            self.locked = False
+            self.cx_ema = None
+            self.depth_ema = None
+            print(f"🔓 Lock perdido (>{LOCK_TIMEOUT_S}s sin detección estable)")
 
-    return vx, vy, vz, yaw_rate
+    def calcular(self, cx, cy, depth_val, cur_alt, t_now):
+        """Pixel + depth + alt → (vx, vy, vz, yaw_rate) en BODY NED."""
+        # EMA en inputs (smooth bbox + depth jitter)
+        if self.cx_ema is None:
+            self.cx_ema = float(cx)
+            self.depth_ema = float(depth_val)
+        else:
+            self.cx_ema    = ALPHA_EMA * self.cx_ema    + (1 - ALPHA_EMA) * cx
+            self.depth_ema = ALPHA_EMA * self.depth_ema + (1 - ALPHA_EMA) * depth_val
+
+        cx_s    = self.cx_ema
+        depth_s = self.depth_ema
+
+        # Pixel error con dead-zone
+        px_err = cx_s - CX_ZED
+        if abs(px_err) < DEAD_ZONE_PX:
+            px_err_eff = 0.0
+        else:
+            px_err_eff = px_err
+
+        # Depth error con dead-zone
+        depth_err = depth_s - DIST_OBJETIVO
+        if abs(depth_err) < DEAD_ZONE_DEPTH:
+            depth_err = 0.0
+
+        # ── Yaw (prioridad: centrar) ──
+        yaw_err  = math.atan2(px_err_eff / FX_ZED, 1.0)
+        yaw_rate_target = _clamp(yaw_err * KP_YAW_RATE, YAW_RATE_MAX)
+
+        # ── Lateral (ayuda a centrar) ──
+        vy_target = _clamp((px_err_eff / CX_ZED) * KP_VY, V_LAT_MAX)
+
+        # ── Forward (depende de qué tan centrado está el target) ──
+        # Si centrado → 1.0. Al borde → 0.6 (piso para asegurar avance
+        # cuando target en curva mantiene px_err no-cero permanente).
+        center_factor = max(0.6, 1.0 - abs(px_err) / CX_ZED)
+        vx_target = _clamp(depth_err * KP_VX * center_factor, V_FWD_MAX)
+
+        # ── Altitud ──
+        alt_err = TAKEOFF_ALT - cur_alt
+        vz_target = _clamp(-alt_err * KP_VZ, V_VERT_MAX)
+
+        # ── Slew rate limit ──
+        dt_cmd = 1.0 / CMD_RATE_HZ
+        vx = self.prev_vx_cmd + _clamp(vx_target - self.prev_vx_cmd, SLEW_VX * dt_cmd)
+        vy = self.prev_vy_cmd + _clamp(vy_target - self.prev_vy_cmd, SLEW_VY * dt_cmd)
+        yaw_rate = self.prev_yaw_cmd + _clamp(yaw_rate_target - self.prev_yaw_cmd,
+                                              SLEW_YAW * dt_cmd)
+        self.prev_vx_cmd  = vx
+        self.prev_vy_cmd  = vy
+        self.prev_yaw_cmd = yaw_rate
+
+        return vx, vy, vz_target, yaw_rate
+
+
+tracker = TargetTracker()
 
 
 # ── HTTP MJPEG stream ─────────────────────────────────────────
@@ -478,6 +569,9 @@ try:
         with modo_lock:
             en_guided = (modo_actual == 'GUIDED')
 
+        t_now = time.time()
+        tracker.check_timeout(t_now)
+
         if chosen is not None:
             clase_id, conf, xyxy = chosen
             x1, y1, x2, y2 = map(int, xyxy)
@@ -493,30 +587,57 @@ try:
                         f"{clase} {conf:.2f} {dv:.1f}m" if depth_ok else f"{clase} {conf:.2f}",
                         (cx, cy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            if conf > 0.40 and depth_ok:
+            should_track = tracker.update_lock(conf, t_now)
+            if should_track and depth_ok:
                 vehiculo = True
-                vx, vy, vz, yr = calcular_velocidad(cx, cy, dv, cur_alt)
+                vx, vy, vz, yr = tracker.calcular(cx, cy, dv, cur_alt, t_now)
                 # Safety: don't descend if already too low
                 if cur_alt < MIN_ALT_M and vz > 0:
                     vz = -0.5
-                if en_guided and (time.time() - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
+                if en_guided and (t_now - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
                     send_velocity_body(vx, vy, vz, yaw_rate=yr)
-                    ultimo_comando = time.time()
-                    print(f"🎯 {clase} c={conf:.2f} d={dv:.1f}m "
+                    ultimo_comando = t_now
+                    lock_tag = "🔒" if tracker.locked else "  "
+                    px_off = (tracker.cx_ema - CX_ZED) if tracker.cx_ema is not None else 0
+                    print(f"🎯{lock_tag} {clase} c={conf:.2f} d={dv:.1f}m "
                           f"vx={vx:+.2f} vy={vy:+.2f} vz={vz:+.2f} "
                           f"yawR={math.degrees(yr):+.0f}°/s alt={cur_alt:.1f}m "
-                          f"lat={(time.time()-t_ini)*1000:.0f}ms")
+                          f"px_off={px_off:+.0f} "
+                          f"lat={(t_now-t_ini)*1000:.0f}ms")
                 elif not en_guided:
                     print(f"👁 {clase} c={conf:.2f} d={dv:.1f}m (MANUAL — no command)")
 
-        # If no target, stream hover (zero velocity) — keeps ArduCopter happy
+        # Sin detección fresca este frame:
+        #   - locked=True y dentro de LOCK_TIMEOUT_S → COAST (mantiene último cmd).
+        #     Crítico para trasera de ambulancia: detecciones son intermitentes,
+        #     decay-a-cero frena el drone y la ambulancia escapa.
+        #   - locked=False (timeout o nunca) → decay vx/vy/yaw a cero, hold alt.
         if not vehiculo and en_guided:
-            if (time.time() - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
-                # Hold altitude only
+            if (t_now - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
                 alt_err = TAKEOFF_ALT - cur_alt
                 vz_hold = _clamp(-alt_err * KP_VZ, V_VERT_MAX)
-                send_velocity_body(0.0, 0.0, vz_hold, yaw_rate=0.0)
-                ultimo_comando = time.time()
+                if tracker.locked:
+                    # COAST: mantener último comando hasta volver a detectar
+                    send_velocity_body(tracker.prev_vx_cmd,
+                                       tracker.prev_vy_cmd,
+                                       vz_hold,
+                                       yaw_rate=tracker.prev_yaw_cmd)
+                    ultimo_comando = t_now
+                    age = t_now - tracker.last_seen_t
+                    print(f"🌊 COAST vx={tracker.prev_vx_cmd:+.2f} "
+                          f"yawR={math.degrees(tracker.prev_yaw_cmd):+.0f}°/s "
+                          f"age={age:.1f}s")
+                else:
+                    # Decay current vx/vy hacia cero respetando slew rate
+                    dt_cmd = 1.0 / CMD_RATE_HZ
+                    vx_d = tracker.prev_vx_cmd + _clamp(-tracker.prev_vx_cmd, SLEW_VX * dt_cmd)
+                    vy_d = tracker.prev_vy_cmd + _clamp(-tracker.prev_vy_cmd, SLEW_VY * dt_cmd)
+                    yr_d = tracker.prev_yaw_cmd + _clamp(-tracker.prev_yaw_cmd, SLEW_YAW * dt_cmd)
+                    tracker.prev_vx_cmd  = vx_d
+                    tracker.prev_vy_cmd  = vy_d
+                    tracker.prev_yaw_cmd = yr_d
+                    send_velocity_body(vx_d, vy_d, vz_hold, yaw_rate=yr_d)
+                    ultimo_comando = t_now
 
         # ── HUD overlay: modo + auto/manual badge ────────────
         with modo_lock:

@@ -1,4 +1,4 @@
-.PHONY: build up down sitl sim shell-sitl shell-sim x11 clean logs
+.PHONY: build up down sitl sim shell-sitl shell-sim x11 clean logs teleop
 
 build:
 	docker compose build
@@ -26,6 +26,9 @@ x11:
 
 logs:
 	docker compose logs -f
+
+teleop:
+	docker compose exec sim bash -lc "source /opt/ros/humble/setup.bash && python3 /sim/scripts/teleop_ambulance.py"
 
 clean:
 	docker compose down -v --rmi local

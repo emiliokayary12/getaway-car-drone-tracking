@@ -19,9 +19,10 @@
         </geometry>
       </collision>
 
-      <!-- Visual: mesh. Y-up glTF → rotate +90° X to make Z-up. -->
+      <!-- Visual: mesh. Y-up glTF → roll +π/2 (Z-up) + yaw +π/2 (alinear
+           mesh-front con body +X para que cara hacia tangente CCW). -->
       <visual name="v">
-        <pose>0 0 0 1.5708 0 0</pose>
+        <pose>0 0 0 1.5708 0 1.5708</pose>
         <geometry>
           <mesh>
             <uri>model://ambulance_mesh/meshes/ambulance.glb</uri>
