@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
 import numpy as np
+from norfair import Detection, Tracker as NFTracker
 from pymavlink import mavutil
 from ultralytics import YOLO
 
@@ -27,8 +28,8 @@ import zed_sim as sl   # drop-in replacement for pyzed.sl
 # ── Config ────────────────────────────────────────────────────
 MODEL_PATH    = os.environ.get("YOLO_MODEL", "/sim/models/best.pt")
 MAVLINK_URL   = os.environ.get("MAVLINK_URL", "udp:127.0.0.1:14551")
-DIST_OBJETIVO = 12.0  # m, target chase distance (safe trailing gap)
-TAKEOFF_ALT   = 6.0   # m (higher to see far + safety margin)
+DIST_OBJETIVO = 8.0   # m, target chase distance (más cerca para no perder lock)
+TAKEOFF_ALT   = 10.0  # m (higher to see far + safety margin)
 
 # ── Velocity-based controller, P-only con suavizado en inputs ──
 # Lecciones de iteraciones anteriores:
@@ -41,8 +42,11 @@ TAKEOFF_ALT   = 6.0   # m (higher to see far + safety margin)
 # sin meter el ruido del propio control. Prioriza centrar (yaw) sobre cerrar
 # distancia: si target off-center, escala vx hacia 0 hasta que drone gire.
 
-KP_VX = 0.7           # P sobre (depth - DIST_OBJETIVO)
-V_FWD_MAX = 12.0      # m/s — cap forward (>>ambulancia 7 m/s para alcanzar)
+KP_VX = 0.6           # P sobre (depth - DIST_OBJETIVO) — bajo para no pasarse de largo
+V_FWD_MAX = 10.0      # m/s — cap forward (>ambulancia 7 m/s pero sin overshoot brutal)
+A_BRAKE = 1.5         # m/s² — decel asumida para curva de frenado
+V_MATCH = 6.0         # m/s — base de la curva (~velocidad ambulancia): cerca del
+                      # target el drone converge a seguirla, no a frenar en seco
 
 KP_VY = 1.0           # P sobre (px_err / CX)
 V_LAT_MAX = 2.0       # m/s — cap lateral
@@ -55,17 +59,29 @@ V_VERT_MAX = 1.0
 
 # Smoothing en inputs + slew limit en comandos
 ALPHA_EMA   = 0.5     # EMA sobre cx y depth. ↑ = más smoothing, más lag
-SLEW_VX     = 4.0     # m/s² — rate máximo de cambio del comando vx
+SLEW_VX_UP   = 2.0    # m/s² — aceleración suave (evita lanzarse al detectar)
+SLEW_VX_DOWN = 6.0    # m/s² — frenado rápido (clave anti-overshoot)
 SLEW_VY     = 2.0
 SLEW_YAW    = 2.0     # rad/s²
 LOCK_TIMEOUT_S = 3.0  # tolerancia alta — trasera de ambulancia da detecciones intermitentes
 
 DEAD_ZONE_PX    = 50  # ignora errores ±N px del centro
 DEAD_ZONE_DEPTH = 2.0 # ignora errores ±N m de DIST_OBJETIVO
-CONF_LOCK    = 0.25   # umbral bajo — trasera de ambulancia tiene bbox/conf chica
-CONF_ACQUIRE = 0.40   # umbral inicial menos exigente para enganchar rápido
+CONF_LOCK    = 0.25   # filtro mínimo para crear/mantener Detection en norfair
+CONF_ACQUIRE = 0.40   # filtro mínimo para crear nuevo track norfair
 MIN_ALT_M    = 3.0
 CMD_RATE_HZ  = 15.0   # rate de setpoints
+
+# ── Norfair tracker (Kalman + ID persistence a través de oclusiones) ──
+# A diferencia del lock simple, norfair extrapola posición de bbox via filtro
+# Kalman durante gaps. Sobrevive oclusiones (edificios/árboles/puentes) que
+# tumban YOLO por varios frames. La identidad del track persiste, así el
+# drone vuelve a engancharse al MISMO objeto cuando reaparece cerca de la
+# trayectoria predicha — no a otro vehículo cercano.
+NF_DIST_THRESHOLD   = 120     # px — match radius entre detección y track
+NF_HIT_COUNTER_MAX  = 45      # frames sin detección antes de matar track (~3s a 15Hz)
+NF_INIT_DELAY       = 2       # frames consecutivos para confirmar nuevo track
+NF_PAST_DETS        = 4       # historial usado por Kalman de norfair
 
 shutdown_flag  = threading.Event()
 emergency_kill = threading.Event()
@@ -314,6 +330,19 @@ def _clamp(x, lim):
     return max(-lim, min(lim, x))
 
 
+def _last_conf(obj) -> float:
+    """Norfair TrackedObject → confidence de la última detección viva."""
+    if obj.last_detection is not None and obj.last_detection.data:
+        return float(obj.last_detection.data.get("conf", 0.0))
+    return 0.0
+
+
+def _last_cls(obj):
+    if obj.last_detection is not None and obj.last_detection.data:
+        return obj.last_detection.data.get("cls")
+    return None
+
+
 # ── Tracker de estado entre frames ──
 class TargetTracker:
     """P-only controller con suavizado en inputs y slew limit en comandos.
@@ -392,18 +421,28 @@ class TargetTracker:
         vy_target = _clamp((px_err_eff / CX_ZED) * KP_VY, V_LAT_MAX)
 
         # ── Forward (depende de qué tan centrado está el target) ──
-        # Si centrado → 1.0. Al borde → 0.6 (piso para asegurar avance
+        # Si centrado → 1.0. Al borde → 0.7 (piso para asegurar avance
         # cuando target en curva mantiene px_err no-cero permanente).
-        center_factor = max(0.6, 1.0 - abs(px_err) / CX_ZED)
+        center_factor = max(0.7, 1.0 - abs(px_err) / CX_ZED)
         vx_target = _clamp(depth_err * KP_VX * center_factor, V_FWD_MAX)
+
+        # ── Curva de frenado: exceso sobre V_MATCH limitado por √(2·a·err) ──
+        # Lejos: sprint hasta V_FWD_MAX. Cerca: converge a V_MATCH (velocidad
+        # de la ambulancia), no a cero → cierra el gap sin pasarse de largo.
+        # Target estático lo cubre el término P (KP_VX·err → 0 en el target).
+        if depth_err > 0:
+            vx_target = min(vx_target,
+                            V_MATCH + math.sqrt(2.0 * A_BRAKE * depth_err))
 
         # ── Altitud ──
         alt_err = TAKEOFF_ALT - cur_alt
         vz_target = _clamp(-alt_err * KP_VZ, V_VERT_MAX)
 
-        # ── Slew rate limit ──
+        # ── Slew rate limit (asimétrico en vx: acelera lento, frena rápido) ──
         dt_cmd = 1.0 / CMD_RATE_HZ
-        vx = self.prev_vx_cmd + _clamp(vx_target - self.prev_vx_cmd, SLEW_VX * dt_cmd)
+        dvx = vx_target - self.prev_vx_cmd
+        slew_vx = SLEW_VX_UP if dvx * self.prev_vx_cmd >= 0 and abs(vx_target) > abs(self.prev_vx_cmd) else SLEW_VX_DOWN
+        vx = self.prev_vx_cmd + _clamp(dvx, slew_vx * dt_cmd)
         vy = self.prev_vy_cmd + _clamp(vy_target - self.prev_vy_cmd, SLEW_VY * dt_cmd)
         yaw_rate = self.prev_yaw_cmd + _clamp(yaw_rate_target - self.prev_yaw_cmd,
                                               SLEW_YAW * dt_cmd)
@@ -415,6 +454,17 @@ class TargetTracker:
 
 
 tracker = TargetTracker()
+
+nf_tracker = NFTracker(
+    distance_function="euclidean",
+    distance_threshold=NF_DIST_THRESHOLD,
+    hit_counter_max=NF_HIT_COUNTER_MAX,
+    initialization_delay=NF_INIT_DELAY,
+    past_detections_length=NF_PAST_DETS,
+)
+last_depth_seen = None       # depth fresca más reciente — persiste durante oclusión
+last_depth_t    = 0.0
+DEPTH_STALE_S   = 2.5        # s — si depth no se actualiza, no controlar vx (solo yaw)
 
 
 # ── HTTP MJPEG stream ─────────────────────────────────────────
@@ -549,20 +599,46 @@ try:
             try: return names_dict.get(cid, f"class_{cid}")
             except AttributeError: return names_dict[cid] if cid in names_dict else f"class_{cid}"
 
+        # ── Construir lista de Detection para norfair ──
+        nf_dets = []
         if r_boxes is not None and len(r_boxes) > 0:
             cls_arr = r_boxes.cls.cpu().numpy().astype(int)
             conf_arr = r_boxes.conf.cpu().numpy()
             xyxy_arr = r_boxes.xyxy.cpu().numpy()
-            keep = np.isin(cls_arr, list(allowed))
+            keep = np.isin(cls_arr, list(allowed)) & (conf_arr >= CONF_LOCK)
             for j in np.where(keep)[0]:
                 x1, y1, x2, y2 = map(int, xyxy_arr[j])
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 255), 2)
                 cv2.putText(annotated, f"{_name(int(cls_arr[j]))} {conf_arr[j]:.2f}",
                             (x1, max(0, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2)
-            if keep.any():
-                masked = np.where(keep, conf_arr, -1.0)
-                i = int(np.argmax(masked))
-                chosen = (int(cls_arr[i]), float(conf_arr[i]), xyxy_arr[i])
+                cx_d = (x1 + x2) / 2.0
+                cy_d = (y1 + y2) / 2.0
+                # Depth en el centro de la bbox (NaN si fuera de rango)
+                err_d, dv_d = depth.get_value(int(cx_d), int(cy_d))
+                nf_dets.append(Detection(
+                    points=np.array([[cx_d, cy_d]]),
+                    scores=np.array([conf_arr[j]]),
+                    data={
+                        "conf": float(conf_arr[j]),
+                        "depth": float(dv_d) if np.isfinite(dv_d) else None,
+                        "cls": int(cls_arr[j]),
+                    },
+                ))
+
+        # Update norfair tracker (extrapola Kalman aunque nf_dets esté vacío)
+        tracked_objects = nf_tracker.update(detections=nf_dets)
+
+        # Pick best track: prefer live (fresh detection) > extrapolado, max conf
+        target_obj = None
+        live_target = None
+        for obj in tracked_objects:
+            if obj.live_points.any():
+                if live_target is None or _last_conf(obj) > _last_conf(live_target):
+                    live_target = obj
+            if target_obj is None:
+                target_obj = obj
+        if live_target is not None:
+            target_obj = live_target
 
         with alt_lock:
             cur_alt = rel_alt_m
@@ -570,74 +646,81 @@ try:
             en_guided = (modo_actual == 'GUIDED')
 
         t_now = time.time()
-        tracker.check_timeout(t_now)
 
-        if chosen is not None:
-            clase_id, conf, xyxy = chosen
-            x1, y1, x2, y2 = map(int, xyxy)
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            clase = _name(clase_id)
+        if target_obj is not None:
+            cx_est, cy_est = target_obj.estimate[0]
+            cx_est = int(round(cx_est))
+            cy_est = int(round(cy_est))
+            is_live = bool(target_obj.live_points.any())
+            conf_show = _last_conf(target_obj)
+            cls_show = _last_cls(target_obj) or 0
+            clase = _name(cls_show)
 
-            err, dv = depth.get_value(cx, cy)
-            depth_ok = np.isfinite(dv)
+            # Depth: si hay detección fresca, refresca cache; si no, usa cache
+            dv_obj = None
+            if is_live and target_obj.last_detection is not None:
+                dv_cand = target_obj.last_detection.data.get("depth")
+                if dv_cand is not None and np.isfinite(dv_cand):
+                    last_depth_seen = float(dv_cand)
+                    last_depth_t = t_now
+                    dv_obj = last_depth_seen
+            if dv_obj is None and last_depth_seen is not None:
+                if (t_now - last_depth_t) <= DEPTH_STALE_S:
+                    dv_obj = last_depth_seen
 
-            cv2.circle(annotated, (cx, cy), 6, (0, 255, 0), -1)
-            cv2.putText(annotated,
-                        f"{clase} {conf:.2f} {dv:.1f}m" if depth_ok else f"{clase} {conf:.2f}",
-                        (cx, cy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            color = (0, 255, 0) if is_live else (0, 165, 255)
+            cv2.circle(annotated, (cx_est, cy_est), 7, color, -1)
+            tag = "TRK" if is_live else "PRED"
+            label = (f"{tag} id={target_obj.id} {clase} c={conf_show:.2f}"
+                     + (f" d={dv_obj:.1f}m" if dv_obj is not None else " d=?"))
+            cv2.putText(annotated, label,
+                        (cx_est, cy_est - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-            should_track = tracker.update_lock(conf, t_now)
-            if should_track and depth_ok:
+            if dv_obj is not None:
                 vehiculo = True
-                vx, vy, vz, yr = tracker.calcular(cx, cy, dv, cur_alt, t_now)
+                vx, vy, vz, yr = tracker.calcular(cx_est, cy_est, dv_obj, cur_alt, t_now)
+                # Si predicción (sin live), reduce yaw_rate y vy para no derivar
+                # demasiado por errores de Kalman; mantén vx (avance).
+                if not is_live:
+                    yr *= 0.5
+                    vy *= 0.3
                 # Safety: don't descend if already too low
                 if cur_alt < MIN_ALT_M and vz > 0:
                     vz = -0.5
                 if en_guided and (t_now - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
                     send_velocity_body(vx, vy, vz, yaw_rate=yr)
                     ultimo_comando = t_now
-                    lock_tag = "🔒" if tracker.locked else "  "
-                    px_off = (tracker.cx_ema - CX_ZED) if tracker.cx_ema is not None else 0
-                    print(f"🎯{lock_tag} {clase} c={conf:.2f} d={dv:.1f}m "
-                          f"vx={vx:+.2f} vy={vy:+.2f} vz={vz:+.2f} "
+                    px_off = cx_est - CX_ZED
+                    age = t_now - last_depth_t if last_depth_t else 0.0
+                    icon = "🎯" if is_live else "🔮"
+                    print(f"{icon} id={target_obj.id} {clase} c={conf_show:.2f} "
+                          f"d={dv_obj:.1f}m vx={vx:+.2f} vy={vy:+.2f} vz={vz:+.2f} "
                           f"yawR={math.degrees(yr):+.0f}°/s alt={cur_alt:.1f}m "
                           f"px_off={px_off:+.0f} "
+                          f"{'LIVE' if is_live else f'KF age={age:.1f}s'} "
                           f"lat={(t_now-t_ini)*1000:.0f}ms")
                 elif not en_guided:
-                    print(f"👁 {clase} c={conf:.2f} d={dv:.1f}m (MANUAL — no command)")
+                    print(f"👁 {clase} c={conf_show:.2f} d={dv_obj:.1f}m (MANUAL — no command)")
 
-        # Sin detección fresca este frame:
-        #   - locked=True y dentro de LOCK_TIMEOUT_S → COAST (mantiene último cmd).
-        #     Crítico para trasera de ambulancia: detecciones son intermitentes,
-        #     decay-a-cero frena el drone y la ambulancia escapa.
-        #   - locked=False (timeout o nunca) → decay vx/vy/yaw a cero, hold alt.
+        # Sin target válido (sin tracks o depth stale):
+        # decay vx/vy/yaw a cero respetando slew, mantener altitud.
+        # (norfair ya maneja la extrapolación interna; aquí solo cae si TODO se perdió.)
         if not vehiculo and en_guided:
             if (t_now - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
                 alt_err = TAKEOFF_ALT - cur_alt
                 vz_hold = _clamp(-alt_err * KP_VZ, V_VERT_MAX)
-                if tracker.locked:
-                    # COAST: mantener último comando hasta volver a detectar
-                    send_velocity_body(tracker.prev_vx_cmd,
-                                       tracker.prev_vy_cmd,
-                                       vz_hold,
-                                       yaw_rate=tracker.prev_yaw_cmd)
-                    ultimo_comando = t_now
-                    age = t_now - tracker.last_seen_t
-                    print(f"🌊 COAST vx={tracker.prev_vx_cmd:+.2f} "
-                          f"yawR={math.degrees(tracker.prev_yaw_cmd):+.0f}°/s "
-                          f"age={age:.1f}s")
-                else:
-                    # Decay current vx/vy hacia cero respetando slew rate
-                    dt_cmd = 1.0 / CMD_RATE_HZ
-                    vx_d = tracker.prev_vx_cmd + _clamp(-tracker.prev_vx_cmd, SLEW_VX * dt_cmd)
-                    vy_d = tracker.prev_vy_cmd + _clamp(-tracker.prev_vy_cmd, SLEW_VY * dt_cmd)
-                    yr_d = tracker.prev_yaw_cmd + _clamp(-tracker.prev_yaw_cmd, SLEW_YAW * dt_cmd)
-                    tracker.prev_vx_cmd  = vx_d
-                    tracker.prev_vy_cmd  = vy_d
-                    tracker.prev_yaw_cmd = yr_d
-                    send_velocity_body(vx_d, vy_d, vz_hold, yaw_rate=yr_d)
-                    ultimo_comando = t_now
+                dt_cmd = 1.0 / CMD_RATE_HZ
+                vx_d = tracker.prev_vx_cmd + _clamp(-tracker.prev_vx_cmd, SLEW_VX_DOWN * dt_cmd)
+                vy_d = tracker.prev_vy_cmd + _clamp(-tracker.prev_vy_cmd, SLEW_VY * dt_cmd)
+                yr_d = tracker.prev_yaw_cmd + _clamp(-tracker.prev_yaw_cmd, SLEW_YAW * dt_cmd)
+                tracker.prev_vx_cmd  = vx_d
+                tracker.prev_vy_cmd  = vy_d
+                tracker.prev_yaw_cmd = yr_d
+                send_velocity_body(vx_d, vy_d, vz_hold, yaw_rate=yr_d)
+                ultimo_comando = t_now
+                n_tracks = len(tracked_objects)
+                print(f"⏳ no-target n_tracks={n_tracks} alt={cur_alt:.1f}m")
 
         # ── HUD overlay: modo + auto/manual badge ────────────
         with modo_lock:
