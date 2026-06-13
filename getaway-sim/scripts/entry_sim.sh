@@ -58,14 +58,14 @@ echo "── DIAG: ROS hz on /camera/image (3s sample) ──"
 timeout 3 ros2 topic hz /camera/image 2>&1 || true
 echo "── DIAG end ROS ──"
 
-echo "── Starting ambulance motion (7 m/s en círculo R≈60m, +30s delay; pausa si /tmp/manual_mode existe) ──"
+echo "── Starting ambulance motion (5 m/s en círculo R≈60m, +30s delay; pausa si /tmp/manual_mode existe) ──"
 (
   sleep 35
   while true; do
     if [ ! -f /tmp/manual_mode ]; then
-      # R = v / ω → 60 = 7 / 0.1167
+      # R = v / ω → 60 = 5 / 0.0833
       gz topic -t /model/ambulance/cmd_vel -m gz.msgs.Twist \
-        -p "linear: {x: 7.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.1167}" 2>/dev/null || true
+        -p "linear: {x: 5.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0833}" 2>/dev/null || true
     fi
     sleep 1
   done

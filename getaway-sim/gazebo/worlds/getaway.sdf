@@ -144,9 +144,11 @@
     </include>
 
     <!-- F450-style quad based on Iris, with forward camera + depth (ZED stand-in) -->
+    <!-- Spawn sobre la calle, 12m detrás de la ambulancia (60,0), mismo yaw=π/2
+         → al despegar la cámara ya apunta hacia donde arranca la ambulancia. -->
     <include>
       <uri>model://iris_with_camera</uri>
-      <pose>0 0 0.195 0 0 0</pose>
+      <pose>60 -12 0.195 0 0 1.5708</pose>
     </include>
 
   </world>
