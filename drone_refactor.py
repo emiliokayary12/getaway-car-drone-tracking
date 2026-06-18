@@ -42,6 +42,26 @@ print(f"✅ ZED intrínsecos: fx={FX_ZED:.1f} fy={FY_ZED:.1f} "
       f"cx={CX_ZED:.1f} cy={CY_ZED:.1f}")
 
 DIST_OBJETIVO = 5.0   # m — mantener 5 m de distancia al vehículo
+TAKEOFF_ALT   = 2.0   # m — debe coincidir con MAV_CMD_NAV_TAKEOFF abajo
+
+# ── Velocity-based PID (P-only) — backport del sim ─────────────
+# Reemplaza el controlador de position-target original. El sim mostró que
+# enviar `SET_POSITION_TARGET_LOCAL_NED` con offsets X/Y absolutos genera
+# overshoot agresivo y el target sale del FOV. Con velocity-target el FC
+# aplica su cascade PID interno (PSC_*/VEL_*/ATC_*) y queda mucho más estable.
+# Caps conservadores vs. sim: hardware necesita margen para primeras pruebas.
+KP_VX = 0.4           # m/s por m de error de profundidad
+V_FWD_MAX = 4.0       # m/s — cap forward (vs 8.0 en sim)
+KP_VY = 1.5           # m/s por px_err normalizado
+V_LAT_MAX = 1.5       # m/s — cap lateral (vs 2.0 en sim)
+KP_YAW_RATE = 0.8     # rad/s por rad de error angular
+YAW_RATE_MAX = 0.5    # rad/s — cap yaw (~28°/s)
+KP_VZ = 0.4
+V_VERT_MAX = 0.8      # m/s — cap vertical (vs 1.0 en sim)
+
+DEAD_ZONE_PX = 60     # ignorar |px_err| < N para no perseguir ruido
+MIN_ALT_M    = 1.0    # piso de seguridad — no descender por debajo
+CMD_RATE_HZ  = 10.0   # rate de setpoints de velocidad
 
 runtime  = sl.RuntimeParameters()
 image    = sl.Mat()
@@ -60,6 +80,11 @@ heading_lock   = threading.Lock()
 # detecta el cambio y deja de mandar comandos de posición.
 modo_actual = None
 modo_lock   = threading.Lock()
+
+# Altitud relativa actual (m) — leída de GLOBAL_POSITION_INT.
+# Necesaria para el canal vz del controlador de velocidad (mantener TAKEOFF_ALT).
+rel_alt_m = 0.0
+alt_lock  = threading.Lock()
 
 # ── CONECTAR PIXHAWK ───────────────────────────────────────────
 print("Conectando con PixHawk...")
@@ -167,6 +192,16 @@ master.mav.command_long_send(
     0, 0, 0, 0, 0
 )
 
+# ── SOLICITAR STREAM DE GLOBAL_POSITION_INT (para altitud relativa) ─
+master.mav.command_long_send(
+    master.target_system, master.target_component,
+    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+    0,
+    mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT,
+    200000,   # us → 5 Hz
+    0, 0, 0, 0, 0
+)
+
 # ── MODO GUIDED ────────────────────────────────────────────────
 modos = master.mode_mapping()
 modos_inv = {v: k for k, v in modos.items()}   # id → nombre, para detectar override RC
@@ -250,9 +285,9 @@ if msg:
 print("Esperando 3 segundos para que suban los motores...")
 time.sleep(3)
 
-# ── HEARTBEAT + WATCHDOG + LECTOR DE ATTITUDE ──────────────────
+# ── HEARTBEAT + WATCHDOG + LECTOR DE ATTITUDE + ALTITUDE ───────
 def heartbeat_y_watchdog():
-    global heading_actual, modo_actual
+    global heading_actual, modo_actual, rel_alt_m
     while not shutdown_flag.is_set():
         master.mav.heartbeat_send(
             mavutil.mavlink.MAV_TYPE_GCS,
@@ -281,61 +316,86 @@ def heartbeat_y_watchdog():
             elif t == 'ATTITUDE':
                 with heading_lock:
                     heading_actual = msg.yaw
+            elif t == 'GLOBAL_POSITION_INT':
+                with alt_lock:
+                    rel_alt_m = msg.relative_alt / 1000.0
 
         time.sleep(0.1)
 
 threading.Thread(target=heartbeat_y_watchdog, daemon=True).start()
 
-# ── COMANDOS DE POSICIÓN ───────────────────────────────────────
-def send_position_body_offset(forward, right, down, yaw=None):
+# ── COMANDO DE VELOCIDAD (BODY_OFFSET_NED) ─────────────────────
+def send_velocity_body(vx, vy, vz, yaw_rate=0.0):
     """
-    Comando de posición relativa al cuerpo del dron (BODY_OFFSET_NED).
-    forward: + adelante (m)
-    right:   + derecha  (m)
-    down:    + abajo    (m)
-    yaw:     rad absoluto en frame mundial; None = no cambiar yaw.
+    Setpoint de velocidad en frame body (NED).
+    vx: + adelante (m/s)
+    vy: + derecha  (m/s)
+    vz: + abajo    (m/s)
+    yaw_rate: + sentido horario visto desde arriba (rad/s)
+
+    type_mask 0x07C7:
+      bits 0-2 (pos)        = 1  → ignorar
+      bits 3-5 (vel)        = 0  → usar
+      bits 6-8 (accel)      = 1  → ignorar
+      bit  9   (force)      = 1  → ignorar
+      bit 10   (yaw abs)    = 1  → ignorar
+      bit 11   (yaw_rate)   = 0  → usar
     """
-    type_mask = 0b0000111111111000   # solo posición
-    if yaw is not None:
-        type_mask &= ~0b010000000000  # también yaw
-        yaw_val = yaw
-    else:
-        yaw_val = 0.0
+    type_mask = 0b0000011111000111  # = 0x07C7
     master.mav.set_position_target_local_ned_send(
         0,
         master.target_system,
         master.target_component,
         mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
         type_mask,
-        forward, right, down,
-        0, 0, 0,
-        0, 0, 0,
-        yaw_val, 0
+        0, 0, 0,            # pos ignorado
+        vx, vy, vz,         # velocidad
+        0, 0, 0,            # accel ignorado
+        0,                  # yaw absoluto ignorado
+        yaw_rate            # rad/s
     )
 
 def hover():
-    """Mantén posición actual (offset 0 en body-frame)."""
-    send_position_body_offset(0.0, 0.0, 0.0)
+    """Setpoint zero — el FC mantiene altitud/posición vía PSC_*."""
+    send_velocity_body(0.0, 0.0, 0.0, 0.0)
 
-# ── CÁLCULO DEL OFFSET AL VEHÍCULO OBJETIVO ────────────────────
-def calcular_offset_objetivo(cx, cy, depth_val):
+def _clamp(x, lim):
+    return max(-lim, min(lim, x))
+
+# ── CÁLCULO DE VELOCIDAD AL VEHÍCULO OBJETIVO ──────────────────
+def calcular_velocidad(cx, cy, depth_val, cur_alt):
     """
-    A partir del centro del bbox y depth de la ZED, devuelve el offset
-    en frame body (forward, right, down) al que ir para quedar a
-    DIST_OBJETIVO del vehículo, y el yaw relativo necesario para
-    centrar el objetivo horizontalmente.
-    Asume la ZED montada mirando hacia adelante alineada con +X body.
+    A partir del centro del bbox + profundidad ZED + altitud relativa,
+    devuelve setpoint de velocidad en frame body (vx fwd, vy right,
+    vz down, yaw_rate). Asume ZED mirando hacia +X body.
+
+    Canales:
+      - vx: P sobre (depth - DIST_OBJETIVO). Saturado a V_FWD_MAX.
+      - vy: P sobre (px_err / CX) — error lateral normalizado.
+      - yaw_rate: P sobre ángulo (px_err / FX) — centra el target.
+      - vz: P sobre (TAKEOFF_ALT - cur_alt) — mantiene altura nominal.
+    Dead-zone en px_err evita perseguir ruido cuando el target ya está centrado.
     """
-    dx_cam = (cx - CX_ZED) / FX_ZED   # tan(ángulo horizontal)
-    dy_cam = (cy - CY_ZED) / FY_ZED   # tan(ángulo vertical)
-    z_cam = depth_val                  # adelante
-    x_cam = dx_cam * depth_val         # derecha
-    y_cam = dy_cam * depth_val         # abajo
-    forward = z_cam - DIST_OBJETIVO    # acercarse manteniendo distancia
-    right   = x_cam
-    down    = y_cam
-    yaw_rel = math.atan2(x_cam, z_cam)
-    return forward, right, down, yaw_rel
+    px_err = cx - CX_ZED
+    if abs(px_err) < DEAD_ZONE_PX:
+        px_err = 0.0
+
+    # Forward: cerrar gap hacia DIST_OBJETIVO
+    vx = _clamp((depth_val - DIST_OBJETIVO) * KP_VX, V_FWD_MAX)
+
+    # Lateral: error de pixel normalizado [-1, +1]
+    x_norm = px_err / CX_ZED
+    vy = _clamp(x_norm * KP_VY, V_LAT_MAX)
+
+    # Yaw rate: small-angle aprox
+    yaw_err  = math.atan2(px_err / FX_ZED, 1.0)
+    yaw_rate = _clamp(yaw_err * KP_YAW_RATE, YAW_RATE_MAX)
+
+    # Altitud: vz positivo = abajo, por eso negamos el error
+    alt_err = TAKEOFF_ALT - cur_alt
+    vz = _clamp(-alt_err * KP_VZ, V_VERT_MAX)
+
+    return vx, vy, vz, yaw_rate
 
 # ── SERVIDOR HTTP PARA VER VIDEO EN VIVO ───────────────────────
 class StreamHandler(BaseHTTPRequestHandler):
@@ -534,37 +594,44 @@ try:
                 if confianza > 0.60 and depth_ok:
                     vehiculo_detectado = True
 
-                    forward, right, down, yaw_rel = calcular_offset_objetivo(
-                        cx, cy, depth_val
+                    with alt_lock:
+                        cur_alt = rel_alt_m
+                    vx, vy, vz, yaw_rate = calcular_velocidad(
+                        cx, cy, depth_val, cur_alt
                     )
-                    with heading_lock:
-                        yaw_abs = heading_actual + yaw_rel
+                    # Safety floor: si ya estamos muy bajo, no descender más
+                    if cur_alt < MIN_ALT_M and vz > 0:
+                        vz = -0.3
                     with modo_lock:
                         en_guided = (modo_actual == 'GUIDED')
 
-                    if en_guided:
-                        send_position_body_offset(
-                            forward, right, down, yaw=yaw_abs
-                        )
+                    # Throttle: setpoints a CMD_RATE_HZ máx
+                    if en_guided and (time.time() - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
+                        send_velocity_body(vx, vy, vz, yaw_rate=yaw_rate)
                         ultimo_comando = time.time()
                         nota = ""
-                    else:
-                        # Piloto tiene control via RC — no mandar comandos
+                    elif not en_guided:
                         nota = f" [piloto/{modo_actual}]"
+                    else:
+                        nota = " [throttled]"
 
                     t_fin = time.time()
                     latencia_ms = (t_fin - t_inicio) * 1000
                     print(f"🎯 {clase} | conf={confianza:.2f} | "
-                          f"dist={depth_val:.1f}m | "
-                          f"f={forward:+.2f} r={right:+.2f} d={down:+.2f} | "
-                          f"yaw_rel={math.degrees(yaw_rel):+.1f}° | "
+                          f"dist={depth_val:.1f}m | alt={cur_alt:.1f}m | "
+                          f"vx={vx:+.2f} vy={vy:+.2f} vz={vz:+.2f} | "
+                          f"yawR={math.degrees(yaw_rate):+.0f}°/s | "
                           f"lat={latencia_ms:.1f}ms{nota}")
 
             if not vehiculo_detectado:
                 with modo_lock:
                     en_guided = (modo_actual == 'GUIDED')
-                if en_guided and time.time() - ultimo_comando > 0.5:
-                    hover()
+                if en_guided and (time.time() - ultimo_comando) >= (1.0 / CMD_RATE_HZ):
+                    # Sin target: mantener altitud, sin velocidad horizontal
+                    with alt_lock:
+                        cur_alt = rel_alt_m
+                    vz_hold = _clamp(-(TAKEOFF_ALT - cur_alt) * KP_VZ, V_VERT_MAX)
+                    send_velocity_body(0.0, 0.0, vz_hold, yaw_rate=0.0)
                     ultimo_comando = time.time()
 
             with frame_lock:
